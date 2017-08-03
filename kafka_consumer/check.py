@@ -81,7 +81,7 @@ class KafkaCheck(AgentCheck):
                 raise Exception('Invalid configuration - if you\'re not collecing '
                                 'offset from ZK you _must_ specify consumer groups')
             if self._kafka_compatible(kafka_version):
-                kafka_consumer_offsets = self._get_offsets_kafka(instance, consumer_groups)
+                _, kafka_consumer_offsets = self._get_kafka_consumer_offsets(instance, consumer_groups)
 
         # Fetch the broker highwater offsets
         highwater_offsets, topic_partitions_without_a_leader = self._get_broker_offsets(instance)
@@ -413,7 +413,7 @@ class KafkaCheck(AgentCheck):
                 self.log.exception('Error cleaning up Zookeeper connection')
         return zk_consumer_offsets, consumer_groups
 
-    def _get_offsets_kafka(self, instance, consumer_groups):
+    def _get_kafka_consumer_offsets(self, instance, consumer_groups):
         consumer_offsets = {}
         topics = defaultdict(set)
 
