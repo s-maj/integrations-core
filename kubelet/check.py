@@ -23,6 +23,15 @@ DEFAULT_SERVICE_EVENT_FREQ = 5 * 60  # seconds
 DEFAULT_NAMESPACES = ['default']
 EVENT_TYPE = 'kubernetes'
 
+CONTAINER_LABELS = [
+    'container_name',  # kubernetes container name
+    'id',  # cgroup path
+    'image',
+    'name',  # docker container name
+    'namespace',  # kubernetes namespace
+    'pod_name'
+]
+
 GAUGE = AgentCheck.gauge
 RATE = AgentCheck.rate
 
@@ -50,7 +59,7 @@ class KubeletCheck(PrometheusCheck):
     """
     def __init__(self, name, init_config, agentConfig, instances=None):
         super(KubeletCheck, self).__init__(name, init_config, agentConfig, instances)
-        self.NAMESPACE = 'kubernetes'
+        self.NAMESPACE = 'kubelet'
 
         if instances is not None and len(instances) > 1:
             raise Exception('Kubernetes check only supports one configured instance.')
@@ -152,39 +161,66 @@ class KubeletCheck(PrometheusCheck):
                 self.log.error("Event collection failed: %s" % str(ex))
 
     def _report_container_spec_metrics(self, pod_list, instance_tags):
+        def _clean_pod_labels(labels):
+            for k in labels.keys():
+                if 'template-generation' in k:
+                    del labels[k]
+            return labels
+
         for pod in pod_list['items']:
+            pod_meta = pod.get('metadata', {})
+            pod_ns, pod_name = pod_meta.get('namespace'), pod_meta.get('name')
+
+            if not pod_name:
+                continue
+
             for ctr in pod['spec']['containers']:
-                if ctr['resources']:
-                    c_name = ctr['name']
-                    _tags = [
-                        'container_image',
-                        'image_name',
-                        'image_tag',
-                        'pod_name',  # if it's no pod, drop it
-                        'kube_namespace'
-                        'kube_container_name'
-                    ]
-                    kube_labels_key = "{0}/{1}".format(pod_namespace, pod_name)
+                if not ctr.get('resources'):
+                    continue
 
-                    pod_labels = kube_labels.get(kube_labels_key)
-                    if pod_labels:
-                        tags += list(pod_labels)
+                tags = [
+                    'pod_name:%s' % pod_name,
+                    'kube_namespace:%s' % pod_ns
+                ]
 
-                    creator stuff
+                c_name = ctr.get('name')
+                if c_name:
+                    tags.append('kube_container_name:%s' % c_name)
 
-                    try:
-                        for resource, value_str in ctr.get('resources', {}).get('requests', {}).iteritems():
-                            value = self.kubeutil.parse_quantity(value_str)
-                            self.publish_gauge(self, '{}.{}.requests'.format(self.NAMESPACE, resource), value, _tags)
-                    except (KeyError, AttributeError) as e:
-                        self.log.debug("Unable to retrieve container requests for %s: %s", c_name, e)
+                c_image = ctr.get('image')
+                if c_image:
+                    tags.append('container_image:%s' % c_image)
 
-                    try:
-                        for resource, value_str in ctr.get('resources', {}).get('limits', {}).iteritems():
-                            value = self.kubeutil.parse_quantity(value_str)
-                            self.publish_gauge(self, '{}.{}.limits'.format(self.NAMESPACE, resource), value, _tags)
-                    except (KeyError, AttributeError) as e:
-                        self.log.debug("Unable to retrieve container limits for %s: %s", c_name, e)
+                split = c_image.split(":")
+                if len(split) > 2:
+                    # if the repo is in the image name and has the form 'docker.clearbit:5000'
+                    # the split will be like [repo_url, repo_port/image_name, image_tag]. Let's avoid that
+                    split = [':'.join(split[:-1]), split[-1]]
+
+                tags.append('image_name:%s' % split[0])
+                if len(split) == 2:
+                    tags.append('image_tag:%s' % split[1])
+
+                pod_labels = pod_meta.get('labels', {})
+                if pod_labels:
+                    pod_labels = _clean_pod_labels(pod_labels)
+                    tags += map(lambda x: '%s:%s' % (x[0], x[1]), pod_labels.iteritems())
+
+                tags += list(self.kubeutil.get_pod_creator_tags(pod_meta))
+
+                try:
+                    for resource, value_str in ctr.get('resources', {}).get('requests', {}).iteritems():
+                        value = self.kubeutil.parse_quantity(value_str)
+                        self.publish_gauge(self, '{}.{}.requests'.format(self.NAMESPACE, resource), value, tags)
+                except (KeyError, AttributeError) as e:
+                    self.log.debug("Unable to retrieve container requests for %s: %s", c_name, e)
+
+                try:
+                    for resource, value_str in ctr.get('resources', {}).get('limits', {}).iteritems():
+                        value = self.kubeutil.parse_quantity(value_str)
+                        self.publish_gauge(self, '{}.{}.limits'.format(self.NAMESPACE, resource), value, tags)
+                except (KeyError, AttributeError) as e:
+                    self.log.debug("Unable to retrieve container limits for %s: %s", c_name, e)
 
     def _report_node_metrics(self, instance_tags):
         machine_info = self.kubeutil.retrieve_machine_info()
@@ -269,6 +305,36 @@ class KubeletCheck(PrometheusCheck):
         for tags, count in tags_map.iteritems():
             tags = list(tags)
             self.publish_gauge(self, self.NAMESPACE + '.pods.running', count, tags)
+
+    def _is_pod_metric(self, metric):
+        """
+        Return whether a metric is about a pod or not.
+        It can be about pods, or even higher levels in the cgroup hierarchy
+        and we don't want to report on that.
+        """
+        for l in CONTAINER_LABELS:
+            if l == 'container_name':
+                for ml in metric.label:
+                    if ml.name == l:
+                        if ml.value == 'POD':
+                            return True
+        return False
+
+    def _is_container_metric(self, metric):
+        """
+        Return whether a metric is about a container or not.
+        It can be about pods, or even higher levels in the cgroup hierarchy
+        and we don't want to report on that.
+        """
+        for l in CONTAINER_LABELS:
+            if l == 'container_name':
+                for ml in metric.label:
+                    if ml.name == l:
+                        if ml.value == 'POD':
+                            return False
+            elif l not in [ml.name for ml in metric.label]:
+                return False
+        return True
 
     def container_cpu_usage_seconds_total(self, message, **kwargs):
         metric_name = self.NAMESPACE + '.cpu.usage.total'
